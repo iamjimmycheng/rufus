@@ -117,8 +117,7 @@ static BOOLEAN __stdcall FormatExCallback(FILE_SYSTEM_CALLBACK_COMMAND Command, 
 	if (IS_ERROR(ErrorStatus))
 		return FALSE;
 
-	assert((actual_fs_type >= 0) && (actual_fs_type < FS_MAX));
-	if ((actual_fs_type < 0) || (actual_fs_type >= FS_MAX))
+	if_not_assert((actual_fs_type >= 0) && (actual_fs_type < FS_MAX))
 		return FALSE;
 
 	switch(Command) {
@@ -1108,6 +1107,10 @@ static int sector_write(int fd, const void* _buf, unsigned int count)
 
 	if (sec_size == 0)
 		sec_size = 512;
+	if_not_assert(sec_size <= 64 * KB)
+		return -1;
+	if_not_assert(count <= 1 * GB)
+		return -1;
 
 	// If we are on a sector boundary and count is multiple of the
 	// sector size, just issue a regular write
@@ -1116,6 +1119,8 @@ static int sector_write(int fd, const void* _buf, unsigned int count)
 
 	// If we have an existing partial sector, fill and write it
 	if (sec_buf_pos > 0) {
+		if_not_assert(sec_size >= sec_buf_pos)
+			return -1;
 		fill_size = min(sec_size - sec_buf_pos, count);
 		memcpy(&sec_buf[sec_buf_pos], buf, fill_size);
 		sec_buf_pos += fill_size;
@@ -1133,10 +1138,18 @@ static int sector_write(int fd, const void* _buf, unsigned int count)
 	written = _write(fd, &buf[fill_size], sec_num * sec_size);
 	if (written < 0)
 		return written;
-	else if (written != sec_num * sec_size)
-		return fill_size + written;
+	if (written != sec_num * sec_size) {
+		// Detect overflows
+		// coverity[overflow]
+		int v = fill_size + written;
+		if_not_assert(v >= fill_size)
+			return -1;
+		else
+			return v;
+	}
 	sec_buf_pos = count - fill_size - written;
-	assert(sec_buf_pos < sec_size);
+	if_not_assert(sec_buf_pos < sec_size)
+		return -1;
 
 	// Keep leftover bytes, if any, in the sector buffer
 	if (sec_buf_pos != 0)
@@ -1150,8 +1163,8 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 	BOOL s, ret = FALSE;
 	LARGE_INTEGER li;
 	HANDLE hSourceImage = INVALID_HANDLE_VALUE;
-	DWORD i, read_size[NUM_BUFFERS], write_size, comp_size, buf_size;
-	uint64_t wb, target_size = bZeroDrive ? SelectedDrive.DiskSize : img_report.image_size;
+	DWORD i, read_size[NUM_BUFFERS] = { 0 }, write_size, comp_size, buf_size;
+	uint64_t wb, target_size = bZeroDrive ? SelectedDrive.DiskSize : MIN((uint64_t)SelectedDrive.DiskSize, img_report.image_size);
 	uint64_t cur_value, last_value = 0;
 	int64_t bled_ret;
 	uint8_t* buffer = NULL;
@@ -1180,7 +1193,8 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 			uprintf("Could not allocate disk zeroing buffer");
 			goto out;
 		}
-		assert((uintptr_t)buffer % SelectedDrive.SectorSize == 0);
+		if_not_assert((uintptr_t)buffer % SelectedDrive.SectorSize == 0)
+			goto out;
 
 		// Clear buffer
 		memset(buffer, fast_zeroing ? 0xff : 0x00, buf_size);
@@ -1192,7 +1206,8 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 				uprintf("Could not allocate disk comparison buffer");
 				goto out;
 			}
-			assert((uintptr_t)cmp_buffer % SelectedDrive.SectorSize == 0);
+			if_not_assert((uintptr_t)cmp_buffer % SelectedDrive.SectorSize == 0)
+				goto out;
 		}
 
 		read_size[0] = buf_size;
@@ -1290,7 +1305,8 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 			uprintf("Could not allocate disk write buffer");
 			goto out;
 		}
-		assert((uintptr_t)sec_buf % SelectedDrive.SectorSize == 0);
+		if_not_assert((uintptr_t)sec_buf% SelectedDrive.SectorSize == 0)
+			goto out;
 		sec_buf_pos = 0;
 		bled_init(256 * KB, uprintf, NULL, sector_write, update_progress, NULL, &ErrorStatus);
 		bled_ret = bled_uncompress_with_handles(hSourceImage, hPhysicalDrive, img_report.compression_type);
@@ -1312,7 +1328,8 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 			goto out;
 		}
 	} else {
-		assert(img_report.compression_type != IMG_COMPRESSION_FFU);
+		if_not_assert(img_report.compression_type != IMG_COMPRESSION_FFU)
+			goto out;
 		// VHD/VHDX require mounting the image first
 		if (img_report.compression_type == IMG_COMPRESSION_VHD ||
 			img_report.compression_type == IMG_COMPRESSION_VHDX) {
@@ -1338,10 +1355,11 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 			uprintf("Could not allocate disk write buffer");
 			goto out;
 		}
-		assert((uintptr_t)buffer % SelectedDrive.SectorSize == 0);
+		if_not_assert((uintptr_t)buffer% SelectedDrive.SectorSize == 0)
+			goto out;
 
 		// Start the initial read
-		ReadFileAsync(hSourceImage, &buffer[read_bufnum * buf_size], buf_size);
+		ReadFileAsync(hSourceImage, &buffer[read_bufnum * buf_size], (DWORD)MIN(buf_size, target_size));
 
 		read_size[proc_bufnum] = 1;	// To avoid early loop exit
 		for (wb = 0; read_size[proc_bufnum] != 0; wb += read_size[proc_bufnum]) {
@@ -1362,21 +1380,26 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, BOOL bZeroDrive)
 				goto out;
 			}
 
-			// 2. Update the read size
-			// 2a) Don't overflow our projected size (mostly for VHDs)
-			if (wb + read_size[read_bufnum] > target_size)
-				read_size[read_bufnum] = (DWORD)(target_size - wb);
-			// 2b) WriteFile fails unless the size is a multiple of sector size
-			if (read_size[read_bufnum] % SelectedDrive.SectorSize != 0)
-				read_size[read_bufnum] = ((read_size[read_bufnum] + SelectedDrive.SectorSize - 1) /
-					SelectedDrive.SectorSize) * SelectedDrive.SectorSize;
+
+			// 2. WriteFile fails unless the size is a multiple of sector size
+			if (read_size[read_bufnum] % SelectedDrive.SectorSize != 0) {
+				if_not_assert(HI_ALIGN_X_TO_Y(read_size[read_bufnum], SelectedDrive.SectorSize) <= buf_size)
+					goto out;
+				read_size[read_bufnum] = HI_ALIGN_X_TO_Y(read_size[read_bufnum], SelectedDrive.SectorSize);
+			}
 
 			// 3. Switch to the next reading buffer
 			proc_bufnum = read_bufnum;
 			read_bufnum = (read_bufnum + 1) % NUM_BUFFERS;
 
 			// 3. Launch the next asynchronous read operation
-			ReadFileAsync(hSourceImage, &buffer[read_bufnum * buf_size], buf_size);
+			// It is VERY IMPORTANT here that we don't attempt to read past the source
+			// or target sizes, as mounted VHDs will SCREW YOU if you attempt to do so
+			// and will even start returning ERRONEOUS DATA for sectors before the end
+			// of the disk... So we make sure to adjust the size not to ever overflow.
+			// Also we need to make sure we add read_size[proc_bufnum] to wb since we
+			// have already read the data and are about to write it.
+			ReadFileAsync(hSourceImage, &buffer[read_bufnum * buf_size], (DWORD)MIN(buf_size, target_size - (wb + read_size[proc_bufnum])));
 
 			// 4. Synchronously write the current data buffer
 			for (i = 1; i <= WRITE_RETRIES; i++) {
@@ -1656,7 +1679,8 @@ DWORD WINAPI FormatThread(void* param)
 		if (img_report.compression_type == IMG_COMPRESSION_FFU) {
 			char cmd[MAX_PATH + 128], *physical = NULL;
 			// Should have been filtered out beforehand
-			assert(has_ffu_support);
+			if_not_assert(has_ffu_support)
+				goto out;
 			safe_unlockclose(hPhysicalDrive);
 			physical = GetPhysicalName(SelectedDrive.DeviceNumber);
 			static_sprintf(cmd, "dism /Apply-Ffu /ApplyDrive:%s /ImageFile:\"%s\"", physical, image_path);
@@ -1844,8 +1868,7 @@ DWORD WINAPI FormatThread(void* param)
 			// All good
 		} else if (target_type == TT_UEFI) {
 			// For once, no need to do anything - just check our sanity
-			assert((boot_type == BT_IMAGE) && IS_EFI_BOOTABLE(img_report) && (fs_type <= FS_NTFS));
-			if ( (boot_type != BT_IMAGE) || !IS_EFI_BOOTABLE(img_report) || (fs_type > FS_NTFS) ) {
+			if_not_assert((boot_type == BT_IMAGE) && IS_EFI_BOOTABLE(img_report) && (fs_type <= FS_NTFS)) {
 				ErrorStatus = RUFUS_ERROR(ERROR_INSTALL_FAILURE);
 				goto out;
 			}
@@ -1920,7 +1943,8 @@ DWORD WINAPI FormatThread(void* param)
 						ErrorStatus = RUFUS_ERROR(APPERR(ERROR_CANT_PATCH));
 				}
 			} else {
-				assert(!img_report.is_windows_img);
+				if_not_assert(!img_report.is_windows_img)
+					goto out;
 				if (!ExtractISO(image_path, drive_name, FALSE)) {
 					if (!IS_ERROR(ErrorStatus))
 						ErrorStatus = RUFUS_ERROR(APPERR(ERROR_ISO_EXTRACT));

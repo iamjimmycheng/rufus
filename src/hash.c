@@ -65,11 +65,11 @@
 #include <string.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <intrin.h>
 #include <windows.h>
 #include <windowsx.h>
 
 #include "db.h"
-#include "cpu.h"
 #include "rufus.h"
 #include "winio.h"
 #include "missing.h"
@@ -77,14 +77,10 @@
 #include "msapi_utf8.h"
 #include "localization.h"
 
-/* Includes for SHA-1 and SHA-256 intrinsics */
-#if defined(CPU_X86_SHA1_ACCELERATION) || defined(CPU_X86_SHA256_ACCELERATION)
-#if defined(_MSC_VER)
-#include <immintrin.h>
-#elif defined(__GNUC__)
-#include <stdint.h>
-#include <x86intrin.h>
-#endif
+#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__i386) || \
+     defined(_X86_) || defined(__I86__) || defined(__x86_64__))
+#define CPU_X86_SHA1_ACCELERATION       1
+#define CPU_X86_SHA256_ACCELERATION     1
 #endif
 
 #if defined(_MSC_VER)
@@ -107,6 +103,7 @@ char hash_str[HASH_MAX][150];
 HANDLE data_ready[HASH_MAX] = { 0 }, thread_ready[HASH_MAX] = { 0 };
 DWORD read_size[NUM_BUFFERS];
 BOOL enable_extra_hashes = FALSE, validate_md5sum = FALSE;
+BOOL cpu_has_sha1_accel = FALSE, cpu_has_sha256_accel = FALSE;
 uint8_t ALIGNED(64) buffer[NUM_BUFFERS][BUFFER_SIZE];
 uint8_t* pe256ssp = NULL;
 uint32_t proc_bufnum, hash_count[HASH_MAX] = { MD5_HASHSIZE, SHA1_HASHSIZE, SHA256_HASHSIZE, SHA512_HASHSIZE };
@@ -115,7 +112,81 @@ uint64_t md5sum_totalbytes;
 StrArray modified_files = { 0 };
 
 extern int default_thread_priority;
-extern const char* efi_bootname[ARCH_MAX];
+extern const char* efi_archname[ARCH_MAX];
+extern char* sbat_level_txt;
+extern BOOL expert_mode, usb_debug;
+
+/*
+ * Detect if the processor supports SHA-1 acceleration. We only check for
+ * the three ISAs we need - SSSE3, SSE4.1 and SHA. We don't check for OS
+ * support or XSAVE because that's been enabled since Windows 2000.
+ */
+BOOL DetectSHA1Acceleration(void)
+{
+#if defined(CPU_X86_SHA1_ACCELERATION)
+#if defined(_MSC_VER)
+	uint32_t regs0[4] = { 0,0,0,0 }, regs1[4] = { 0,0,0,0 }, regs7[4] = { 0,0,0,0 };
+	const uint32_t SSSE3_BIT = 1u << 9; /* Function 1, Bit  9 of ECX */
+	const uint32_t SSE41_BIT = 1u << 19; /* Function 1, Bit 19 of ECX */
+	const uint32_t SHA_BIT = 1u << 29; /* Function 7, Bit 29 of EBX */
+
+	__cpuid(regs0, 0);
+	const uint32_t highest = regs0[0]; /*EAX*/
+
+	if (highest >= 0x01) {
+		__cpuidex(regs1, 1, 0);
+	}
+	if (highest >= 0x07) {
+		__cpuidex(regs7, 7, 0);
+	}
+
+	return (regs1[2] /*ECX*/ & SSSE3_BIT) && (regs1[2] /*ECX*/ & SSE41_BIT) && (regs7[1] /*EBX*/ & SHA_BIT) ? TRUE : FALSE;
+#elif defined(__GNUC__) || defined(__clang__)
+	/* __builtin_cpu_supports available in GCC 4.8.1 and above */
+	return __builtin_cpu_supports("ssse3") && __builtin_cpu_supports("sse4.1") && __builtin_cpu_supports("sha") ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
+#else
+	return FALSE;
+#endif
+}
+
+/*
+ * Detect if the processor supports SHA-256 acceleration. We only check for
+ * the three ISAs we need - SSSE3, SSE4.1 and SHA. We don't check for OS
+ * support or XSAVE because that's been enabled since Windows 2000.
+ */
+BOOL DetectSHA256Acceleration(void)
+{
+#if defined(CPU_X86_SHA256_ACCELERATION)
+#if defined(_MSC_VER)
+	uint32_t regs0[4] = { 0,0,0,0 }, regs1[4] = { 0,0,0,0 }, regs7[4] = { 0,0,0,0 };
+	const uint32_t SSSE3_BIT = 1u << 9; /* Function 1, Bit  9 of ECX */
+	const uint32_t SSE41_BIT = 1u << 19; /* Function 1, Bit 19 of ECX */
+	const uint32_t SHA_BIT = 1u << 29; /* Function 7, Bit 29 of EBX */
+
+	__cpuid(regs0, 0);
+	const uint32_t highest = regs0[0]; /*EAX*/
+
+	if (highest >= 0x01) {
+		__cpuidex(regs1, 1, 0);
+	}
+	if (highest >= 0x07) {
+		__cpuidex(regs7, 7, 0);
+	}
+
+	return (regs1[2] /*ECX*/ & SSSE3_BIT) && (regs1[2] /*ECX*/ & SSE41_BIT) && (regs7[1] /*EBX*/ & SHA_BIT) ? TRUE : FALSE;
+#elif defined(__GNUC__) || defined(__clang__)
+	/* __builtin_cpu_supports available in GCC 4.8.1 and above */
+	return __builtin_cpu_supports("ssse3") && __builtin_cpu_supports("sse4.1") && __builtin_cpu_supports("sha") ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
+#else
+	return FALSE;
+#endif
+}
 
 /*
  * Rotate 32 or 64 bit integers by n bytes.
@@ -1607,8 +1678,7 @@ static int cmp_pe_section(const void* arg1, const void* arg2)
  * @len:    Size of @efi
  * @regp:   Pointer to a list of regions
  *
- * Parse image binary in PE32(+) format, assuming that sanity of PE image
- * has been checked by a caller.
+ * Parse image binary in PE32(+) format.
  *
  * Return:  TRUE on success, FALSE on error
  */
@@ -1623,7 +1693,11 @@ BOOL efi_image_parse(uint8_t* efi, size_t len, struct efi_image_regions** regp)
 	uint32_t align, size, authsz;
 	size_t bytes_hashed;
 
+	if (len < 0x80)
+		return FALSE;
 	dos = (void*)efi;
+	if (dos->e_lfanew > len - 0x40)
+		return FALSE;
 	nt = (void*)(efi + dos->e_lfanew);
 	authsz = 0;
 
@@ -1757,36 +1831,18 @@ err:
  * for some part of this but you'd be very, very wrong since the PE sections it
  * feeds to the hash function does include the PE header checksum field...
  */
-BOOL PE256File(const char* path, uint8_t* hash)
+BOOL PE256Buffer(uint8_t* buf, uint32_t len, uint8_t* hash)
 {
 	BOOL r = FALSE;
 	HASH_CONTEXT hash_ctx = { {0} };
 	int i;
-	uint32_t rb;
-	uint8_t* buf = NULL;
-	struct __stat64 stat64 = { 0 };
 	struct efi_image_regions* regs = NULL;
 
-	if ((path == NULL) || (hash == NULL))
-		goto out;
-
-	/* Filter anything that would be out of place as a EFI bootloader */
-	if (_stat64U(path, &stat64) != 0) {
-		uprintf("Could not open '%s", path);
-		goto out;
-	}
-	if ((stat64.st_size < 1 * KB) || (stat64.st_size > 64 * MB)) {
-		uprintf("'%s' is either too small or too large for PE-256", path);
-		goto out;
-	}
-
-	/* Read the executable into a memory buffer */
-	rb = read_file(path, &buf);
-	if (rb < 1 * KB)
+	if ((buf == NULL) || (len == 0) || (len < 1 * KB) || (len > 64 * MB) || (hash == NULL))
 		goto out;
 
 	/* Isolate the PE sections to hash */
-	if (!efi_image_parse(buf, rb, &regs))
+	if (!efi_image_parse(buf, len, &regs))
 		goto out;
 
 	/* Hash the relevant PE data */
@@ -1800,7 +1856,6 @@ BOOL PE256File(const char* path, uint8_t* hash)
 
 out:
 	free(regs);
-	free(buf);
 	return r;
 }
 
@@ -2095,36 +2150,189 @@ BOOL IsFileInDB(const char* path)
 	return FALSE;
 }
 
-int IsBootloaderRevoked(const char* path)
+static BOOL IsRevokedBySbat(uint8_t* buf, uint32_t len)
 {
-	version_t* ver;
+	char* sbat = NULL, *version_str;
+	uint32_t i, j, sbat_len;
+	sbat_entry_t entry;
+
+	if (sbat_entries == NULL)
+		return FALSE;
+
+	// Look for a .sbat section
+	sbat = GetPeSection(buf, ".sbat", &sbat_len);
+	if (sbat == NULL || sbat < (char*)buf || sbat >= (char*)buf + len)
+		return FALSE;
+
+	for (i = 0; sbat[i] != '\0'; ) {
+		while (sbat[i] == '\n')
+			i++;
+		if (sbat[i] == '\0')
+			break;
+		entry.product = &sbat[i];
+		for (; sbat[i] != ',' && sbat[i] != '\0' && sbat[i] != '\n'; i++);
+		if (sbat[i] == '\0' || sbat[i] == '\n')
+			break;
+		sbat[i++] = '\0';
+		version_str = &sbat[i];
+		for (; sbat[i] != ',' && sbat[i] != '\0' && sbat[i] != '\n'; i++);
+		sbat[i++] = '\0';
+		entry.version = atoi(version_str);
+		uuprintf("  SBAT: %s,%d", entry.product, entry.version);
+		for (; sbat[i] != '\0' && sbat[i] != '\n'; i++);
+		if (entry.version == 0)
+			continue;
+		for (j = 0; sbat_entries[j].product != NULL; j++) {
+			if (strcmp(entry.product, sbat_entries[j].product) == 0 && entry.version < sbat_entries[j].version)
+				return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
+static BOOL IsRevokedBySvn(uint8_t* buf, uint32_t len)
+{
+	wchar_t* rsrc_name = NULL;
+	uint8_t *root;
+	uint32_t i, j, rsrc_rva, rsrc_len, *svn_ver;
+	IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)buf;
+	IMAGE_NT_HEADERS32* pe_header;
+	IMAGE_NT_HEADERS64* pe64_header;
+	IMAGE_DATA_DIRECTORY img_data_dir;
+
+	if (sbat_entries == NULL)
+		return FALSE;
+
+	for (i = 0; sbat_entries[i].product != NULL; i++) {
+		// SVN entries are expected to be uppercase
+		for (j = 0; j < strlen(sbat_entries[i].product) && isupper(sbat_entries[i].product[j]); j++);
+		if (j < strlen(sbat_entries[i].product))
+			continue;
+		rsrc_name = utf8_to_wchar(sbat_entries[i].product);
+		if (rsrc_name == NULL)
+			continue;
+
+		pe_header = (IMAGE_NT_HEADERS32*)&buf[dos_header->e_lfanew];
+		if (pe_header->FileHeader.Machine == IMAGE_FILE_MACHINE_I386 || pe_header->FileHeader.Machine == IMAGE_FILE_MACHINE_ARM) {
+			img_data_dir = pe_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+		} else {
+			pe64_header = (IMAGE_NT_HEADERS64*)pe_header;
+			img_data_dir = pe64_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+		}
+
+		root = RvaToPhysical(buf, img_data_dir.VirtualAddress);
+		rsrc_rva = FindResourceRva(rsrc_name, root, root, &rsrc_len);
+		safe_free(rsrc_name);
+		if (rsrc_rva != 0) {
+			if (rsrc_len == sizeof(uint32_t)) {
+				svn_ver = (uint32_t*)RvaToPhysical(buf, rsrc_rva);
+				if (svn_ver != NULL) {
+					uuprintf("  SVN version: %d.%d", *svn_ver >> 16, *svn_ver & 0xffff);
+					if (*svn_ver < sbat_entries[i].version)
+						return TRUE;
+				}
+			} else {
+				uprintf("WARNING: Unexpected Secure Version Number size");
+			}
+		}
+	}
+	return FALSE;
+}
+
+static BOOL IsRevokedByCert(cert_info_t* info)
+{
+	int i;
+
+	for (i = 0; i < ARRAYSIZE(certdbx); i += SHA1_HASHSIZE) {
+		if (!expert_mode)
+			continue;
+		if (memcmp(info->thumbprint, &certdbx[i], SHA1_HASHSIZE) == 0) {
+			uprintf("Found '%s' revoked certificate", info->name);
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+BOOL IsSignedBySecureBootAuthority(uint8_t* buf, uint32_t len)
+{
+	int i;
+	uint8_t* cert;
+	cert_info_t info;
+
+	if (buf == NULL || len < 0x100)
+		return FALSE;
+
+	// Get the signer/issuer info
+	cert = GetPeSignatureData(buf);
+	// Secure Boot Authority is always an issuer
+	if (GetIssuerCertificateInfo(cert, &info) != 2)
+		return FALSE;
+	for (i = 0; i < ARRAYSIZE(certauth); i += SHA1_HASHSIZE) {
+		if (memcmp(info.thumbprint, &certauth[i], SHA1_HASHSIZE) == 0)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+int IsBootloaderRevoked(uint8_t* buf, uint32_t len)
+{
 	uint32_t i;
 	uint8_t hash[SHA256_HASHSIZE];
+	IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)buf;
+	IMAGE_NT_HEADERS32* pe_header;
+	uint8_t* cert;
+	cert_info_t info;
+	int r;
 
-	if (!PE256File(path, hash))
+	// Fall back to embedded sbat_level.txt if we couldn't access remote
+	if (sbat_entries == NULL) {
+		sbat_level_txt = safe_strdup(db_sbat_level_txt);
+		sbat_entries = GetSbatEntries(sbat_level_txt);
+	}
+
+	if (buf == NULL || len < 0x100 || dos_header->e_magic != IMAGE_DOS_SIGNATURE)
+		return -2;
+	pe_header = (IMAGE_NT_HEADERS32*)&buf[dos_header->e_lfanew];
+	if (pe_header->Signature != IMAGE_NT_SIGNATURE)
+		return -2;
+
+	// Get the signer/issuer info
+	cert = GetPeSignatureData(buf);
+	r = GetIssuerCertificateInfo(cert, &info);
+	if (r == 0)
+		uuprintf("  (Unsigned Bootloader)");
+	else if (r > 0)
+		uuprintf("  Signed by: %s", info.name);
+
+	if (!PE256Buffer(buf, len, hash))
 		return -1;
+	// Check for UEFI DBX revocation
 	for (i = 0; i < ARRAYSIZE(pe256dbx); i += SHA256_HASHSIZE)
 		if (memcmp(hash, &pe256dbx[i], SHA256_HASHSIZE) == 0)
 			return 1;
+	// Check for Microsoft SSP revocation
 	for (i = 0; i < pe256ssp_size * SHA256_HASHSIZE; i += SHA256_HASHSIZE)
 		if (memcmp(hash, &pe256ssp[i], SHA256_HASHSIZE) == 0)
 			return 2;
-	ver = GetExecutableVersion(path);
-	// Blanket filter for Windows 10 1607 (excluded) to Windows 10 20H1 (excluded)
-	// TODO: Revoke all bootloaders prior to 2023.05 once Microsoft does
-// 	uprintf("Found UEFI bootloader version: %d.%d.%d.%d", ver->Major, ver->Minor, ver->Micro, ver->Nano);
-	if (ver != NULL && ver->Major == 10 && ver->Minor == 0 && ver->Micro > 14393 && ver->Micro < 19041)
+	// Check for Linux SBAT revocation
+	if (IsRevokedBySbat(buf, len))
 		return 3;
+	// Check for Microsoft SVN revocation
+	if (IsRevokedBySvn(buf, len))
+		return 4;
+	// Check for UEFI DBX certificate revocation
+	if (IsRevokedByCert(&info))
+		return 5;
 	return 0;
 }
 
 void PrintRevokedBootloaderInfo(void)
 {
-	uprintf("Found %d officially revoked UEFI bootloaders from embedded list", sizeof(pe256dbx) / SHA256_HASHSIZE);
-	if (ParseSKUSiPolicy())
+	uprintf("Found %d revoked UEFI bootloaders from embedded list", sizeof(pe256dbx) / SHA256_HASHSIZE);
+	if (ParseSKUSiPolicy() && pe256ssp_size != 0)
 		uprintf("Found %d additional revoked UEFI bootloaders from this system's SKUSiPolicy.p7b", pe256ssp_size);
-	else
-		uprintf("WARNING: Could not parse this system's SkuSiPolicy.p7b for additional revoked UEFI bootloaders");
 }
 
 /*
@@ -2145,16 +2353,16 @@ void UpdateMD5Sum(const char* dest_dir, const char* md5sum_name)
 	intptr_t pos;
 	uint32_t i, j, size, md5_size, new_size;
 	uint8_t sum[MD5_HASHSIZE];
-	char md5_path[64], path1[64], path2[64], *md5_data = NULL, *new_data = NULL, *str_pos;
-	char *d, *s, *p;
+	char md5_path[64], path1[64], path2[64], bootloader_name[32];
+	char *md5_data = NULL, *new_data = NULL, *str_pos, *d, *s, *p;
 
 	if (!img_report.has_md5sum && !validate_md5sum)
-		goto out;
+		return;
 
 	static_sprintf(md5_path, "%s\\%s", dest_dir, md5sum_name);
 	md5_size = read_file(md5_path, (uint8_t**)&md5_data);
 	if (md5_size == 0)
-		goto out;
+		return;
 
 	for (i = 0; i < modified_files.Index; i++) {
 		for (j = 0; j < (uint32_t)strlen(modified_files.String[i]); j++)
@@ -2186,7 +2394,7 @@ void UpdateMD5Sum(const char* dest_dir, const char* md5sum_name)
 		new_data = malloc(md5_size + 1024);
 		assert(new_data != NULL);
 		if (new_data == NULL)
-			goto out;
+			return;
 		// Will be nonzero if we created the file, otherwise zero
 		if (md5sum_totalbytes != 0) {
 			snprintf(new_data, md5_size + 1024, "# md5sum_totalbytes = 0x%llx\n", md5sum_totalbytes);
@@ -2197,12 +2405,13 @@ void UpdateMD5Sum(const char* dest_dir, const char* md5sum_name)
 		}
 		s = md5_data;
 		// Extract the MD5Sum bootloader(s)
-		for (i = 1; i < ARRAYSIZE(efi_bootname); i++) {
-			static_sprintf(path1, "%s\\efi\\boot\\%s", dest_dir, efi_bootname[i]);
+		for (i = 1; i < ARRAYSIZE(efi_archname); i++) {
+			static_sprintf(bootloader_name, "boot%s.efi", efi_archname[i]);
+			static_sprintf(path1, "%s\\efi\\boot\\boot%s.efi", dest_dir, efi_archname[i]);
 			if (!PathFileExistsA(path1))
 				continue;
 			res_data = (BYTE*)GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_MD5_BOOT + i),
-				_RT_RCDATA, efi_bootname[i], &res_size, FALSE);
+				_RT_RCDATA, bootloader_name, &res_size, FALSE);
 			static_strcpy(path2, path1);
 			path2[strlen(path2) - 4] = 0;
 			static_strcat(path2, "_original.efi");
@@ -2229,20 +2438,21 @@ void UpdateMD5Sum(const char* dest_dir, const char* md5sum_name)
 		}
 		// Rename the original bootloaders if present in md5sum.txt
 		for (p = md5_data; (p = StrStrIA(p, " ./efi/boot/boot")) != NULL; ) {
-			for (i = 1; i < ARRAYSIZE(efi_bootname); i++) {
-				if (p[12 + strlen(efi_bootname[i])] != 0x0a)
+			for (i = 1; i < ARRAYSIZE(efi_archname); i++) {
+				static_sprintf(bootloader_name, "boot%s.efi", efi_archname[i]);
+				if (p[12 + strlen(bootloader_name)] != 0x0a)
 					continue;
-				p[12 + strlen(efi_bootname[i])] = 0;
-				if (lstrcmpiA(&p[12], efi_bootname[i]) == 0) {
-					size = (uint32_t)(p - s) + 12 + (uint32_t)strlen(efi_bootname[i]) - 4;
+				p[12 + strlen(bootloader_name)] = 0;
+				if (lstrcmpiA(&p[12], bootloader_name) == 0) {
+					size = (uint32_t)(p - s) + 12 + (uint32_t)strlen(bootloader_name) - 4;
 					memcpy(d, s, size);
 					d = &d[size];
 					strcpy(d, "_original.efi\n");
 					new_size += 9;
 					d = &d[14];
-					s = &p[12 + strlen(efi_bootname[i]) + 1];
+					s = &p[12 + strlen(bootloader_name) + 1];
 				}
-				p[12 + strlen(efi_bootname[i])] = 0x0a;
+				p[12 + strlen(bootloader_name)] = 0x0a;
 			}
 			p = &p[12];
 		}
@@ -2255,10 +2465,6 @@ void UpdateMD5Sum(const char* dest_dir, const char* md5sum_name)
 
 	write_file(md5_path, md5_data, md5_size);
 	free(md5_data);
-
-out:
-	// We no longer need the string array at this stage
-	StrArrayDestroy(&modified_files);
 }
 
 #if defined(_DEBUG) || defined(TEST) || defined(ALPHA)
